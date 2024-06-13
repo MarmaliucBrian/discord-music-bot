@@ -1,146 +1,179 @@
 import discord
+from discord.ext import commands
 import os
 import asyncio
 import yt_dlp
 from dotenv import load_dotenv
-import random
+import urllib.parse, urllib.request, re
 
 def run_bot():
     load_dotenv()
     TOKEN = os.getenv('discord_token')
-    intens = discord.Intents.default()
-    intens.message_content = True
-    client = discord.Client(intents=intens)
+    print(f"TOKEN: {TOKEN}")  # Debugging output to check the value of TOKEN
+    intents = discord.Intents.default()
+    intents.message_content = True
+    client = commands.Bot(command_prefix=".", intents=intents)
 
-    voice_clients = {}  # Dictionary to hold voice clients per guild
+    queues = {}
+    voice_clients = {}
+    youtube_base_url = 'https://www.youtube.com/'
+    youtube_results_url = youtube_base_url + 'results?'
+    youtube_watch_url = youtube_base_url + 'watch?v='
+    youtube_playlist_url = youtube_base_url + 'playlist?list='
     yt_dl_options = {"format": "bestaudio/best"}
     ytdl = yt_dlp.YoutubeDL(yt_dl_options)
-    ffmpeg_options = {'options': '-vn'}
+
+    ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                      'options': '-vn -filter:a "volume=0.25"'}
+
+    # Flag to track if a skip operation is in progress
+    skip_in_progress = {}
 
     @client.event
     async def on_ready():
-        print(f'{client.user} has connected to Discord!')
+        print(f'{client.user} is now jamming')
 
-    @client.event
-    async def on_message(message):
-        if message.author == client.user:
-            return  # Ignore messages sent by the bot itself
+    async def play_next(ctx):
+        try:
+            if queues[ctx.guild.id]:
+                link = queues[ctx.guild.id].pop(0)
+                await play(ctx, link=link)
+            else:
+                await ctx.send("Queue is empty!")
+        except Exception as e:
+            print(f"Error in play_next: {e}")
 
-        if message.content.startswith('?play'):
-            try:
-                # Check if the author is in a voice channel
-                if message.author.voice is None:
-                    await message.channel.send("You are not connected to a voice channel.")
-                    return
+    @client.command(name="clear_queue")
+    async def clear_queue(ctx):
+        if ctx.guild.id in queues:
+            queues[ctx.guild.id].clear()
+            await ctx.send("Queue cleared!")
+        else:
+            await ctx.send("There is no queue to clear")
 
-                # Connect to the voice channel of the message author
-                voice_client = await message.author.voice.channel.connect()
-                voice_clients[message.guild.id] = voice_client
+    @client.command(name="pause")
+    async def pause(ctx):
+        try:
+            voice_clients[ctx.guild.id].pause()
+        except Exception as e:
+            print(e)
 
-            except Exception as e:
-                print(e)
+    @client.command(name="resume")
+    async def resume(ctx):
+        try:
+            voice_clients[ctx.guild.id].resume()
+        except Exception as e:
+            print(e)
+
+    @client.command(name="stop")
+    async def stop(ctx):
+        try:
+            voice_clients[ctx.guild.id].stop()
+            await voice_clients[ctx.guild.id].disconnect()
+            del voice_clients[ctx.guild.id]
+        except Exception as e:
+            print(e)
+
+    @client.command(name="queue")
+    async def queue(ctx, *, url):
+        if ctx.guild.id not in queues:
+            queues[ctx.guild.id] = []
+        queues[ctx.guild.id].append(url)
+        await ctx.send("Added to queue!")
+
+    @client.command(name="skip")
+    async def skip(ctx):
+        try:
+            if ctx.guild.id in skip_in_progress and skip_in_progress[ctx.guild.id]:
+                await ctx.send("Already skipping, please wait.")
                 return
 
-            try:
-                url = message.content.split()[1]
+            skip_in_progress[ctx.guild.id] = True
+
+            if voice_clients[ctx.guild.id]:
+                voice_clients[ctx.guild.id].stop()
+                await ctx.send("Skipped the current song.")
+                await play_next(ctx)
+            else:
+                await ctx.send("No song is currently playing!")
+
+            skip_in_progress[ctx.guild.id] = False
+
+        except Exception as e:
+            await ctx.send("Failed to skip the current song.")
+            print(e)
+
+    @client.command(name="playlist")
+    async def playlist(ctx, *, url):
+        try:
+            if youtube_playlist_url in url:
+                playlist_id = url.split('list=')[1]
+                data = ytdl.extract_info(url, download=False)
+                songs = [entry['webpage_url'] for entry in data['entries'] if 'webpage_url' in entry]
+
+                if ctx.guild.id not in queues:
+                    queues[ctx.guild.id] = []
+
+                if not voice_clients[ctx.guild.id].is_playing() and not voice_clients[ctx.guild.id].is_paused():
+                    queues[ctx.guild.id].extend(songs)
+                    await ctx.send(f"Added {len(songs)} songs from the playlist to the queue!")
+                    await play_next(ctx)
+                else:
+                    queues[ctx.guild.id].extend(songs)
+                    await ctx.send(f"Added {len(songs)} songs from the playlist to the queue!")
+
+            else:
+                await ctx.send("Invalid YouTube playlist URL.")
+
+        except Exception as e:
+            await ctx.send("Error adding playlist to queue.")
+            print(e)
+
+    @client.command(name="join")
+    async def join(ctx):
+        try:
+            if ctx.author.voice:
+                channel = ctx.author.voice.channel
+                voice_client = await channel.connect()
+                voice_clients[ctx.guild.id] = voice_client
+            else:
+                await ctx.send("You are not connected to a voice channel.")
+        except Exception as e:
+            await ctx.send(f"Failed to join the voice channel: {e}")
+
+    @client.command(name="play")
+    async def play(ctx, *, link=None):
+        try:
+            voice_client = voice_clients.get(ctx.guild.id)
+            if not voice_client:
+                voice_client = await ctx.author.voice.channel.connect()
+                voice_clients[ctx.guild.id] = voice_client
+
+            if link:
+                if youtube_base_url not in link:
+                    query_string = urllib.parse.urlencode({
+                        'search_query': link
+                    })
+                    content = urllib.request.urlopen(
+                        youtube_results_url + query_string
+                    )
+                    search_results = re.findall(r'/watch\?v=(.{11})', content.read().decode())
+                    link = youtube_watch_url + search_results[0]
 
                 loop = asyncio.get_event_loop()
-                data = await loop.run_in_executor(None, ytdl.extract_info, url, {'download': False})
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
 
                 if 'entries' in data:
-                    # Playlist handling
-                    playlist = []
-                    for entry in data['entries']:
-                        song = entry['url']
-                        playlist.append(song)
-
-                    # Shuffle the playlist
-                    random.shuffle(playlist)
-
-                    # Start playing the shuffled playlist
-                    await play_song(message, playlist)
-
+                    songs = [entry['url'] for entry in data['entries']]
                 else:
-                    song = data['url']
-                    player = discord.FFmpegPCMAudio(song, **ffmpeg_options)
-                    voice_clients[message.guild.id].play(player)
-                    await message.channel.send(f"Now playing: {data['title']}")
+                    songs = [data['url']]
 
-            except yt_dlp.DownloadError as e:
-                if 'Video unavailable' in str(e):
-                    await message.channel.send("This video is unavailable due to a copyright claim.")
-                else:
-                    await message.channel.send(f"An error occurred: {e}")
-                    voice_clients[message.guild.id].stop()
-            except Exception as e:
-                await message.channel.send(f"An error occurred: {e}")
-                voice_clients[message.guild.id].stop()
+                for song in songs:
+                    player = discord.FFmpegOpusAudio(song, **ffmpeg_options)
+                    voice_clients[ctx.guild.id].play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
 
-        elif message.content.startswith('?pause'):
-            try:
-                voice_clients[message.guild.id].pause()
-                await message.channel.send("Playback paused.")
-            except Exception as e:
-                await message.channel.send(f"An error occurred: {e}")
-
-        elif message.content.startswith('?resume'):
-            try:
-                voice_clients[message.guild.id].resume()
-                await message.channel.send("Playback resumed.")
-            except Exception as e:
-                await message.channel.send(f"An error occurred: {e}")
-
-        elif message.content.startswith('?skip'):
-            try:
-                voice_clients[message.guild.id].stop()
-                await message.channel.send("Skipped to the next song.")
-            except Exception as e:
-                await message.channel.send(f"An error occurred: {e}")
-
-        elif message.content.startswith('?stop'):
-            try:
-                voice_clients[message.guild.id].stop()
-                await voice_clients[message.guild.id].disconnect()
-                del voice_clients[message.guild.id]
-                await message.channel.send("Playback stopped.")
-            except Exception as e:
-                await message.channel.send(f"An error occurred: {e}")
-
-        elif message.content.startswith('?shuffle'):
-            try:
-                # Check if there's a playlist currently playing
-                if message.guild.id in voice_clients and voice_clients[message.guild.id].is_playing():
-                    # Get the current playlist
-                    current_playlist = []
-                    for entry in voice_clients[message.guild.id].source.playlist:
-                        current_playlist.append(entry.url)
-
-                    # Shuffle the current playlist
-                    random.shuffle(current_playlist)
-
-                    # Clear the current playlist
-                    voice_clients[message.guild.id].stop()
-
-                    # Start playing the shuffled playlist
-                    await play_song(message, current_playlist)
-
-                    await message.channel.send("Shuffled the playlist!")
-
-                else:
-                    await message.channel.send("No playlist is currently playing.")
-
-            except Exception as e:
-                await message.channel.send(f"An error occurred: {e}")
-
-    async def play_song(message, playlist):
-        for song in playlist:
-            player = discord.FFmpegPCMAudio(song, **ffmpeg_options)
-            voice_clients[message.guild.id].play(player)
-            await message.channel.send(f"Now playing: {song}")
-            while voice_clients[message.guild.id].is_playing():
-                await asyncio.sleep(1)
+        except Exception as e:
+            print(e)
 
     client.run(TOKEN)
 
-if __name__ == "__main__":
-    run_bot()
